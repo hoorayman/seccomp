@@ -1,0 +1,19 @@
+{
+  // 本仓库是 linux-only 的（seccomp 是 Linux 内核特性），
+  // 但我们在 macOS 上开发，IDE 默认用 darwin 的 Go 工具链做语义分析，
+  // 于是 syscall.SYS_OPENAT / SYS_PRCTL 这类 linux-only 常量会全部报 "undefined"。
+  // 让 gopls 按 linux 分析即可，代码一行都不用改。
+  "go.toolsEnvVars": {
+    "GOOS": "linux",
+    "GOARCH": "amd64",
+    "CGO_ENABLED": "0"
+  },
+  "gopls": {
+    "build.env": {
+      "GOOS": "linux",
+      "GOARCH": "amd64",
+      "CGO_ENABLED": "0"
+    }
+  },
+  "idf.currentSetup": "/Users/zhongguo/.espressif/v6.1/esp-idf"
+}
