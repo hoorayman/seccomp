@@ -11,6 +11,9 @@
 
 四步口诀：**装（Install）→ 拦（过滤器）→ 判（supervisor）→ 办（ADDFD）**。
 
+> 内核版本要求（USER_NOTIF 5.0 / CONTINUE 5.5 / ADDFD 5.9 / ADDFD_FLAG_SEND 5.14）
+> 见 [README 4.1 内核版本依赖](../README.md#41-内核版本依赖)。
+
 ---
 
 ## 图 1：全景，一次系统调用在内核里遇到什么
@@ -99,14 +102,13 @@
                 │        │ launcher  pid 13                 │
                 │◀───────┤ ④ seccomp(NEW_LISTENER) → fd 4   │
                 │  fd 5  │ ⑤ sendmsg(SCM_RIGHTS, fd 4)       │
-                │ (dup)  │ ⑥ clear O_CLOEXEC                │
+                │ (dup)  │ ⑥ 保持 CLOEXEC，exec 自动关      │
                 │        │ ⑦ execve(payload)  ← pid 不变     │
                 │        └──────────────┬───────────────────┘
                 │                       │ execve
                 │        ┌──────────────▼───────────────────┐
                 │        │ payload  pid 13（还是 13！）     │
-                │        │ 继承 fd 4 与过滤器               │
-                │        │ close(4)  ← 关自己的副本也没事   │
+                │        │ 继承过滤器，但 fd 4 已被 exec 关 │
                 │        └──────────────┬───────────────────┘
                 │                       │ os.OpenFile(..., O_WRONLY|O_CREAT)
                 │                       ▼
@@ -120,7 +122,9 @@
                 └──────────────────────────────────────▶ payload 的 openat 返回 3
 ```
 
-**关键认知**：两边持有的是**同一个内核对象的两份引用**（fd 号不同）。payload 关掉自己那份不影响监控；supervisor 关掉最后一份 → 全体 `ENOSYS`（demo5）。
+**关键认知**：launcher / supervisor 两边持有的是**同一个内核对象的两份引用**（fd 号不同），
+交接完 launcher 那份被 `execve` 收走（CLOEXEC），所以最后只剩 supervisor 一份——
+它一关，被拦的 syscall 全部 `ENOSYS`（demo5）。裁决权自始至终没进过沙箱。
 
 对应代码：`cmd/03-roles/{supervisor,launcher,payload}/main.go`、`internal/notif/fdpass.go`。
 

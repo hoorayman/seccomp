@@ -34,6 +34,11 @@ func main() {
 	fmt.Println("== Demo 03 角色一: supervisor（沙箱外，不受过滤器约束）==")
 
 	setupDirs()
+	// AF_UNIX 的路径是文件系统里一个真实的 socket inode，进程退出不会自动消失（不像 TCP 端口），
+	// 所以上一次跑的残留会让这次的 bind() 直接 EADDRINUSE。先删掉。
+	// 注意这是"盲删"：如果真有一个活着的 supervisor，删掉路径只会让它变成没人能连的孤儿，
+	// 新的那个谁先绑上谁说了算——所以目录权限必须收紧。更稳的做法是先 connect 探活，
+	// 或者改用抽象命名空间（名字以 '\0' 开头，不进文件系统、进程一退就没了）。
 	os.Remove(sockPath)
 
 	lfd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
@@ -50,7 +55,7 @@ func main() {
 	check(err, "接收 listener fd")
 	syscall.Close(cfd)
 	syscall.Close(lfd)
-	os.Remove(sockPath)
+	os.Remove(sockPath) // 收工顺手清掉自己创建的那个 inode，免得下次运行撞 EADDRINUSE
 
 	fmt.Printf("收到 listener fd = %d，开始仲裁\n\n", listenerFd)
 	n := notif.Open(listenerFd)
@@ -91,9 +96,12 @@ func handle(n *notif.Notifier, req *scmp.Notif) {
 		}
 	}
 
-	// 1) dirfd 必须真的是 CWD，否则路径可以相对某个目录被"拼"出来，
-	//    校验的路径和实际打开的路径就不是一回事了（dirfd 逃逸）。
-	if dirfd != -100 { // AT_FDCWD
+	// 1) openat 的 dirfd 决定"相对路径以谁为基准解析"：
+	//    真实的目录 fd → 相对那个目录；AT_FDCWD（内核约定的魔法值 -100）→ 相对**调用进程自己的 cwd**。这里访问的绝对路径（像cmd/03-roles/payload/main.go），AT_FDCWD不起作用，不影响。
+	//    这里只接受后者。否则目标进程可以传一个自己打开的目录 fd，把"校验的字符串"和
+	//    "实际会被打开的文件"错开——supervisor 后面是用这个字符串在**自己的** cwd 下重新
+	//    open 的，两边基准一旦不同就是 dirfd 逃逸。
+	if dirfd != -100 { // AT_FDCWD == -100
 		deny(fmt.Sprintf("dirfd=%d 不是 AT_FDCWD，本 demo 不支持相对路径", dirfd))
 		return
 	}
@@ -139,6 +147,7 @@ func handle(n *notif.Notifier, req *scmp.Notif) {
 	//    注意这条日志要在 ioctl 之前打：ADDFD 一返回，目标进程就被解封了，
 	//    日志顺序会看起来像"目标先成功、supervisor 后决定"。
 	fmt.Printf("[allow] tid=%-5d 用 supervisor 的权限打开成功，注入 fd 并把 fd 号回填给目标\n", req.PID)
+	// supervisor 先自己把文件打开，再把那个 fd「塞进」目标进程的 fd 表，并把这个 fd 号当作目标进程 openat 的返回值。
 	if _, err := n.AddfdAndSend(req.ID, sfd, syscall.O_CLOEXEC); err != nil {
 		fmt.Println("[allow] ADDFD 失败:", err)
 	}
@@ -155,6 +164,13 @@ func validate(path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", errors.New("只接受绝对路径")
 	}
+	// filepath.Clean(path) 的作用是对路径进行“清理”，返回一个在词法上最简化的路径。它不检查路径是否存在，只做纯字符串层面的规范化。
+	// 🧹 它具体做什么
+	// 消除多余的斜杠：a//b → a/b
+	// 处理 .（当前目录）：a/./b → a/b，单独的 . 会变成 .
+	// 处理 ..（上级目录）：a/b/../c → a/c，能消掉的 .. 会被消掉
+	// 去掉末尾的斜杠：a/b/ → a/b（根目录 / 除外）
+	// 空字符串变成 .：Clean("") 返回 .
 	clean := filepath.Clean(path)
 	if !strings.HasPrefix(clean, allowDir) {
 		return "", fmt.Errorf("不在白名单目录 %s 下", allowDir)

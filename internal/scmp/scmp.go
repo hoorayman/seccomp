@@ -25,13 +25,22 @@ const (
 )
 
 // seccomp(2) 的 flags
+//
+// 取值必须对照 /usr/include/linux/seccomp.h 抄，错一位内核就报 EINVAL：
+//
+//	SECCOMP_FILTER_FLAG_TSYNC                 (1UL << 0)
+//	SECCOMP_FILTER_FLAG_LOG                   (1UL << 1)
+//	SECCOMP_FILTER_FLAG_SPEC_ALLOW            (1UL << 2)
+//	SECCOMP_FILTER_FLAG_NEW_LISTENER          (1UL << 3)
+//	SECCOMP_FILTER_FLAG_TSYNC_ESRCH           (1UL << 4)  5.7+
+//	SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV    (1UL << 5)  5.19+
 const (
+	FlagTSync            = 1 << 0 // 把新过滤器同步到本进程所有线程
 	FlagLog              = 1 << 1 // 只记录不拦截（配合 RET_LOG）
 	FlagSpecAllow        = 1 << 2
 	FlagNewListener      = 1 << 3 // 关键：为 SECCOMP_RET_USER_NOTIF 创建 listener fd
-	FlagTSync            = 1 << 4 // 把过滤器同步到本进程所有线程
-	FlagTSyncESRCH       = 1 << 5
-	FlagWaitKillableRecv = 1 << 6 // 5.19+：等待通知可被致命信号打断
+	FlagTSyncESRCH       = 1 << 4 // 5.7+：TSYNC 失败返回 -ESRCH 而非 tid；NEW_LISTENER+TSYNC 必须带上它
+	FlagWaitKillableRecv = 1 << 5 // 5.19+：等待通知可被致命信号打断
 )
 
 // prctl(2) 的 option
@@ -64,6 +73,7 @@ const (
 )
 
 // Errno 把 errno 编码成返回值，用于 RET_ERRNO。
+// 不直接写 scmp.RetErrno！因为 e = 0 时，内核算的是 -0，误以为是成功返回
 func Errno(e syscall.Errno) uint32 { return RetErrno | uint32(e)&0xffff }
 
 // seccomp_notif / seccomp_notif_resp / seccomp_notif_addfd 这三个结构体
@@ -147,10 +157,18 @@ func NoNewPrivs() error {
 //
 // 返回 listener fd（只在 flags 含 FlagNewListener 时有意义，其它情况返回 -1）。
 //
-// 两个容易踩的点：
-//  1. seccomp 过滤器天然是"每线程"的，Go 程序一启动就有多个线程，
-//     所以必须带 *FlagTSync*，否则只有当前线程被约束，其它线程照跑不误。
-//  2. FlagNewListener 返回的 fd 带 O_CLOEXEC，想让它活过 execve 必须自己清掉。
+// 三个容易踩的点：
+//  1. seccomp 过滤器天然是"每线程"的：只有执行 seccomp() 的那个线程会被装上。
+//     FlagTSync 能把新过滤器同步到本进程所有线程（实测有效），但调用方仍应先
+//     runtime.LockOSThread()：TSYNC 失败时内核不设 errno，只把"肇事的 tid"当返回值，
+//     不带 FlagTSyncESRCH 的话很容易被误判成成功。
+//  2. FlagNewListener 返回的 fd 带 CLOEXEC，所以默认不会漏给 execve 之后的进程——
+//     这通常正是你要的（裁决权不该跑进沙箱）。确实需要它活过 execve，才用
+//     fcntl(fd, F_SETFD, 0) 清掉 FD_CLOEXEC。
+//  3. FlagNewListener 和 FlagTSync 不能裸着一起用——内核直接返回 EINVAL。
+//     5.7+ 必须再补上 FlagTSyncESRCH（man seccomp(2)：不设该位时二者组合即 EINVAL）。
+//     demo2/03/04/05 用的就是 FlagNewListener|FlagTSync|FlagTSyncESRCH，
+//     此时返回值仍然是 listener fd。
 func Install(p *bpf.Prog, flags uintptr, noNewPrivs bool) (int, error) {
 	if noNewPrivs { // 普通用户必须设，否则 seccomp 会返回 EACCES。
 		if err := NoNewPrivs(); err != nil {
@@ -166,14 +184,23 @@ func Install(p *bpf.Prog, flags uintptr, noNewPrivs bool) (int, error) {
 	if errno != 0 {
 		return -1, fmt.Errorf("seccomp(SECCOMP_SET_MODE_FILTER, flags=0x%x): %w", flags, errno)
 	}
-	// TSYNC 失败时内核通过返回值给出"捣乱的那个线程的 tid"，
-	// 此时 errno 不会被设置，r1 是个正数，容易被误当成成功。
-	// FlagNewListener 是 seccomp 过滤器的一种特殊安装模式，它的核心作用是：安装过滤器后，不再只是简单地放行或拒绝系统调用，而是返回一个文件描述符（fd），让用户态程序能够“监听”并接管特定的系统调用。
-	// FlagNewListener 和 TSYNC 是互斥的，不能同时使用。
-	// 原因在于返回值的语义冲突：
-	//   TSYNC 失败时：返回值是一个正数（肇事线程的 tid）。
-	//   FlagNewListener 成功时：返回值也是一个正数（新的监听 fd）。
-	//   内核无法仅凭返回值区分“TSYNC 失败了”还是“NewListener 成功了”。
+	// 不带 NEW_LISTENER 时，r1 的正常值是 0；TSYNC 失败时内核不设 errno，
+	// 而是把"无法同步的那个线程的 tid"当返回值，正数很容易被误当成成功。
+	// FlagNewListener 是 seccomp 过滤器的一种特殊安装模式：装好过滤器后不直接放行/拒绝，
+	// 而是返回一个 fd，让用户态程序"监听"并接管被拦下的系统调用。
+	//
+	// 带 NEW_LISTENER 时返回值就是 listener fd；再带上 TSYNC_ESRCH 之后，
+	// TSYNC 同步失败走 errno（-ESRCH），不会再出现"fd 还是 tid"的歧义。
+	// 所以下面这个"r1 是 tid"的判断只对不带 NEW_LISTENER 的调用有意义。
+	//
+	// ===========================================
+	// ESRCH （Error Search）— No such process. (没有这个进程)
+	// 冲突的根源在于返回值的语义模糊：
+	// NEW_LISTENER 成功时：seccomp() 返回一个正数（新的监听文件描述符 fd）。
+	// TSYNC 失败时：seccomp() 也返回一个正数（导致同步失败的线程 ID）。
+	// 如果两个标志一起用，调用方拿到一个正数时，根本分不清这到底是“监听器创建成功”还是“TSYNC 同步失败”。为了避免歧义，内核干脆禁止了这个组合。
+	// 🛠️ TSYNC_ESRCH 如何解决：
+	// 这个标志（Linux 5.7 引入）告诉内核：当 TSYNC 同步失败时，不要返回那个线程 ID，而是直接设置 errno = ESRCH 并返回 -1 。
 	if flags&FlagNewListener == 0 && r1 != 0 {
 		return -1, fmt.Errorf("seccomp TSYNC 失败，肇事线程 tid=%d", r1)
 	}

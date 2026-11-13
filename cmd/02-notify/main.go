@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 
 	"seccomplab/internal/notif"
@@ -26,12 +27,17 @@ import (
 )
 
 func main() {
+	// 装过滤器和发 socket() 必须在同一个 OS 线程上，否则可能漂到未过滤的线程
+	// 导致"演示偶尔不灵"（详见 README 坑 10）。
+	runtime.LockOSThread()
+
 	fmt.Println("== Demo 02: USER_NOTIF —— 把系统调用交给用户态裁决 ==")
 
 	p := scmp.NotifyList([]uint32{uint32(syscall.SYS_SOCKET)})
 	fmt.Print(p.String())
 
-	listener, err := scmp.Install(p, scmp.FlagNewListener|scmp.FlagTSync, true)
+	// NEW_LISTENER 和 TSYNC 不能裸用（EINVAL），5.7+ 必须补上 TSYNC_ESRCH，见 README 坑 10。
+	listener, err := scmp.Install(p, scmp.FlagNewListener|scmp.FlagTSync|scmp.FlagTSyncESRCH, true)
 	if err != nil {
 		fmt.Println("安装过滤器失败:", err)
 		os.Exit(1)

@@ -180,9 +180,13 @@ KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > USER_NOTIF > TRACE > LOG > ALLOW
 
 ### 3.6 生效范围（几个容易把人坑哭的点）
 
-- **每线程生效。** 不是每进程。`clone` 出来的线程继承，但**如果你在 A 线程装过滤器，
-  B 线程早就跑起来了，B 不受影响**。Go 程序一启动就有多个线程，所以必须用
-  `SECCOMP_FILTER_FLAG_TSYNC`（见 `Install` 的实现），否则你以为拦住了，其实只拦住了自己。
+- **每线程生效。** 不是每进程。`clone` 出来的新线程会继承创建者的过滤器，但**如果你在 A 线程装过滤器，
+  B 线程早就跑起来了，B 不受影响**。Go 程序一启动就有 6~7 个 OS 线程（实测），
+  所以要么装的时候带 `TSYNC` 把已存在的线程一起盖上，要么就得保证"装过滤器的线程 =
+  之后发 syscall 的线程"——本项目两者都做，细节和实测数据见
+  [坑 10](#坑-10tsync-与-new_listener-必须补-tsync_esrch)。
+- **`execve` 只保留"执行它的那个线程"的过滤器**，pid 不变。这是 `launcher` 模式的基础，
+  也是它必须 `runtime.LockOSThread()` 的原因。
 - **`execve` 后依然有效**，pid 不变。这是 `launcher` 模式的基础。
 - **`fork`/`clone` 子进程继承**。所以限制住一个进程，它 spawn 出来的子孙都在笼子里。
 - **非 root 必须先 `PR_SET_NO_NEW_PRIVS`。** 它顺便也堵住了 setuid 提权。
@@ -224,6 +228,46 @@ KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > USER_NOTIF > TRACE > LOG > ALLOW
 这些 ioctl 号不是背下来的，是算出来的（`_IOC(dir, type, nr, size)`），
 `size` 直接取 `unsafe.Sizeof(结构体)`——**结构体布局一旦和内核不一致，ioctl 号就错，立刻就 `ENOTTY`**，
 这比"悄悄跑错"安全得多。
+
+### 4.1 内核版本依赖
+
+基础能力从 **Linux 5.0**（2019-03）开始，但后面几个补丁才让它真正可用：
+
+| 内核版本 | 新增 | 影响 |
+|---|---|---|
+| **5.0** | `SECCOMP_RET_USER_NOTIF`、`NEW_LISTENER`、`RECV`/`SEND`/`ID_VALID` | 能用，但没有 `CONTINUE`，也没有 `ADDFD` |
+| **5.5** | `SECCOMP_USER_NOTIF_FLAG_CONTINUE` | 才能"让内核真的执行"（demo2 / demo4 的用法） |
+| **5.9** | `SECCOMP_IOCTL_NOTIF_ADDFD` | **demo3 的安全路径从这里才存在** |
+| **5.14** | `SECCOMP_ADDFD_FLAG_SEND` | 注入 + 响应原子化，否则退化成 `ID_VALID` → `ADDFD` → `SEND` 三步 |
+| **5.19** | `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` | 等待通知时能被致命信号打断，避免线程"杀不掉" |
+
+编译期还需要 `CONFIG_SECCOMP=y` + `CONFIG_SECCOMP_FILTER=y`（主流发行版默认开）。
+
+**运行时确认（最可靠，别只看 `uname -r`）：**
+
+```bash
+cat /proc/sys/kernel/seccomp/actions_avail      # 必须含 user_notif
+grep Seccomp /proc/<pid>/status                 # Seccomp: 2 表示在过滤器下, Seccomp_filters: 层数
+```
+
+注意 `actions_avail` 只反映**基础动作**，`ADDFD` / `ADDFD_FLAG_SEND` 这类后来新增的 ioctl
+不在里面——判断办法只能是"试一次，看是不是 `EINVAL`/`ENOTTY`"，
+这正是 `notif.AddfdAndSend` 里那段回退逻辑在做的事。
+
+**各 demo 的最低要求：**
+
+| 想跑 | 最低内核 | 原因 |
+|---|---|---|
+| `demo1` | 3.5 | 只需要 cBPF 过滤器 |
+| `demo2` / `demo4` | **5.5** | 需要 `CONTINUE` |
+| `demo3` | **5.9** | 需要 `ADDFD` 才能"代劳" |
+| `demo3` 的原子版本 | **5.14** | 否则走三步走回退 |
+| `demo5` | 5.0 | 只用到基础行为 |
+
+**本项目建议 5.14+**，这样 demo3 走的是原子路径，中间没有窗口。
+
+顺带澄清：**user_notif 不需要 root，也不需要 `CAP_SYS_ADMIN`**。
+`Makefile` 里的 `--cap-add SYS_PTRACE` 是为了让 supervisor 读 `/proc/<tid>/mem`，与 user_notif 无关。
 
 ---
 
@@ -318,10 +362,18 @@ listener fd 的最后一个引用被关掉之后，所有被拦的系统调用�
 
 ### 坑 7：listener fd 本身就是权限
 
-谁拿到这个 fd，谁就能裁决。它有 `dup`、能被 `SCM_RIGHTS` 传给任何人、能活过 `execve`。
+谁拿到这个 fd，谁就能裁决——能 `READ` 通知的进程，就能回 `CONTINUE` 或 `EPERM`。
+它还能 `dup`、能被 `SCM_RIGHTS` 传给任何人。
 
-- 它默认带 `O_CLOEXEC`，想让它活过 `execve` 必须自己清掉（`launcher` 里做了）。
-- 反过来，**不要**把它留在不该留的地方：一个能让攻击者写 fd 的进程，等于把裁决权拱手让人。
+- 它默认带 `CLOEXEC`，所以 **`execve` 会自动把它关掉**。这是对的默认值：
+  `launcher` 交完 fd 就 `execve(payload)`，不需要（也**不应该**）用
+  `fcntl(fd, F_SETFD, 0)` 去清掉 `FD_CLOEXEC`，否则 payload 一启动就继承了裁决权。
+  （`execve` 看的是 fd 的 `FD_CLOEXEC` 位，不是 file 的 `f_flags`。）
+- 交接只需要一份引用：`SCM_RIGHTS` 传出去的就是同一个 `struct file`，
+  supervisor 握着它，通知队列就不会因为 launcher 这边被 `execve` 收走而消失。
+- **不要**把它留在不该留的地方。除了"被审的人自己握着钥匙"之外还有个副作用：
+  沙箱内进程长期持有 listener 时，supervisor 崩了队列仍活着，
+  被拦的 syscall 不会 fail-open 成 `ENOSYS`（demo5 那套），而是**永远挂住**。
 - 同一个 listener 允许多个进程同时 `RECV`：通知会被**随机一个**消费者拿走。
   所以一个 listener 只交给**一个**可信 supervisor，不要"多副本高可用"。
 
@@ -341,6 +393,77 @@ listener fd 的最后一个引用被关掉之后，所有被拦的系统调用�
 - 32 位兼容进程的参数是 32 位的，`args` 高 32 位是垃圾；`openat` 的 `flags` 在内核里是
   `unsigned int`，取低 32 位就够（demo3 的 supervisor 里写了注释）。
 - supervisor 自己也该被审计/限制——它是最有权限的那个进程。
+
+### 坑 10：TSYNC 与 NEW_LISTENER 必须补 TSYNC_ESRCH
+
+这条踩过两次，两次都是实测出来的（`--security-opt seccomp=unconfined` 容器内，内核 7.0.14）。
+前提仍然是：**goroutine ≠ 线程**——Go 程序刚启动就有 6~7 个 OS 线程
+（sysmon、GC worker、netpoller 各占一个），而 seccomp 过滤器是**每线程**的。
+
+**① flags 的位值一位都不能记错。** 对着 `/usr/include/linux/seccomp.h`：
+
+```c
+#define SECCOMP_FILTER_FLAG_TSYNC              (1UL << 0)
+#define SECCOMP_FILTER_FLAG_LOG                (1UL << 1)
+#define SECCOMP_FILTER_FLAG_SPEC_ALLOW         (1UL << 2)
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER       (1UL << 3)
+#define SECCOMP_FILTER_FLAG_TSYNC_ESRCH        (1UL << 4)   /* 5.7+ */
+#define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1UL << 5)   /* 5.19+ */
+```
+
+写错一位的后果不是"不生效"那么明显，而是 **EINVAL 或者悄悄变成另一个语义**：
+把 `TSYNC` 写成 `1<<4`，字面上还是"带同步的安装"，实际设的是 `TSYNC_ESRCH`，
+**同步压根没开**。而 demo 照样跑得通（`LockOSThread` 兜住了），所以这种 bug 能藏很久——
+本仓库早期版本就中过这个招。
+
+**② `NEW_LISTENER` 和 `TSYNC` 确实互斥。** man seccomp(2) 原文：
+
+> If this flag is not set, using **SECCOMP_FILTER_FLAG_NEW_LISTENER** and
+> **SECCOMP_FILTER_FLAG_TSYNC** together results in **EINVAL**.
+
+"this flag" 指的是 `TSYNC_ESRCH`。也就是说 5.7+ 想同时要 listener 和"盖住所有线程"，
+必须三合一。实测（每次一个独立进程，装完读 `/proc/self/task/*/status`）：
+
+| flags | seccomp() 结果 | 安装后各线程 `Seccomp:` |
+|---|---|---|
+| `0x0` | 成功，r1=0 | 只有调用线程 =2，其余 0 |
+| `0x1` `TSYNC` | 成功，r1=0 | **7 个线程全部 =2** |
+| `0x8` `NEW_LISTENER` | 成功，r1=4（listener fd） | 只有调用线程 =2 |
+| `0x9` `NEW_LISTENER\|TSYNC` | **EINVAL** | 全部 0 |
+| `0x19` `NEW_LISTENER\|TSYNC\|TSYNC_ESRCH` | 成功，r1=4 | **全部 =2** |
+| `0x40`（不存在的位） | EINVAL | 全部 0 |
+
+两个要点：**TSYNC 在 Go 进程里是好用的**（早期这节写的"TSYNC 返回 0 但兄弟线程没盖上"
+是上面那个位值 bug 的产物，已更正）；而 `NEW_LISTENER` 还必须独占——
+同一个线程第二次带它装过滤器会返回 `EBUSY`。
+
+**③ 那为什么仍然要 `LockOSThread()`？** 因为 TSYNC 只解决"安装这一刻已经存在的线程"，
+剩下两条路它是救不了的：
+
+1. **TSYNC 失败不设 errno。** 内核把"无法同步的那个线程 tid"当返回值（只有带
+   `TSYNC_ESRCH` 才变成 `-ESRCH`）。不带 ESRCH 时，一个正整数返回值既可能是新 fd，
+   也可能是肇事 tid，很容易被当成成功。
+2. **`execve` 只保留执行它的那个线程的过滤器。** launcher 场景里，装完过滤器后
+   goroutine 只要迁移一次，出去的 payload 就是完全没过滤器的裸进程，而且毫无报错。
+
+所以写法是两层保险，缺一不可：
+
+```go
+runtime.LockOSThread()                                  // ① 钉住线程
+scmp.Install(p, scmp.FlagTSync|scmp.FlagTSyncESRCH, true) // ② 能盖的全盖上
+syscall.Socket(...) / syscall.Exec(...)                  // ③ 同一个线程上发
+```
+
+三个必须锁线程的地方（本项目全部加了）：
+
+| 位置 | 不锁的后果 |
+|---|---|
+| demo1/02/05：装完就在主 goroutine 发 syscall | 没带 TSYNC 或同步失败时，goroutine 漂到未过滤线程 → **静默不拦截** |
+| demo4：装完立刻发 `openat` | 同上，通知压根不产生，demo 变成"什么都没发生" |
+| **launcher：装完 → 传 fd → `execve`** | 即使 TSYNC 成功也救不了：`execve` 只认执行线程 → **payload 完全没有过滤器** |
+
+最后一行最隐蔽：`execve` 是"整个进程只剩一个线程继续跑"的时刻，
+选错线程 = 你精心装的沙箱凭空消失，而且全程没有任何报错。
 
 ---
 
@@ -364,7 +487,7 @@ listener fd 的最后一个引用被关掉之后，所有被拦的系统调用�
    ┌─────────────────────────┐              ┌──────────────────────────────┐
    │ 1. listen /tmp/lab.sock │◀── connect ──│ 2. 装过滤器 NEW_LISTENER      │
    │ 3. recvmsg 收 fd        │◀─ SCM_RIGHTS─│ 4. 把 listener fd 递出去      │
-   │ 5. loop RECV            │              │ 6. 清 O_CLOEXEC               │
+   │ 5. loop RECV            │              │ 6. 保持 CLOEXEC，exec 自动关  │
    │    ├ 读 /proc/tid/mem   │              │ 7. execve(payload)  ← pid 不变│
    │    ├ 策略校验           │              │                              │
    │    └ ADDFD 注入 fd      │── 通知/裁决 ─▶│ payload 只会看到 fd 号        │
@@ -424,7 +547,8 @@ cmd/05-fail-open           listener 关闭后的 ENOSYS
 
 几处值得对着看的地方：
 
-- `scmp.Install`：为什么必须 `TSYNC`、为什么 `TSYNC` 失败时返回值是"肇事 tid"而不是 errno。
+- `scmp.Install`：为什么 `NEW_LISTENER` 配 `TSYNC` 必须再补 `TSYNC_ESRCH`，
+  以及为什么 `TSYNC` 失败时返回的是"肇事 tid"而不是 errno。
 - `scmp.NotifyWriteOpenAt`：只用一条 `AND` 就把"写打开"筛了出来，
   所以 Go runtime 启动时那一堆只读 `openat` 不会打到 supervisor 上。
 - `notif.ioctlRecv` 等：ioctl 号是算出来的，`size` 用 `unsafe.Sizeof`。
@@ -469,6 +593,19 @@ cmd/05-fail-open           listener 关闭后的 ENOSYS
 
 Docker Desktop for Mac 用的是一台 LinuxKit 虚拟机，`docker run` 就是真 Linux 内核，
 seccomp 全部可用（本项目实测内核 7.0.14）。
+
+想知道自己手上的环境够不够（版本要求见 [4.1 内核版本依赖](#41-内核版本依赖)）：
+
+```bash
+docker run --rm --security-opt seccomp=unconfined seccomp-lab sh -c \
+  'uname -r; cat /proc/sys/kernel/seccomp/actions_avail'
+# 7.0.14-linuxkit
+# kill_process kill_thread trap errno user_notif trace log allow
+```
+
+`actions_avail` 里出现 `user_notif` 才算能跑 demo2 之后的例子。
+发行版大致对照：Ubuntu 22.04 / Debian 12（5.15 / 6.1）全功能；Debian 11（5.10）缺 `ADDFD_FLAG_SEND`，
+走三步走回退；Ubuntu 20.04（5.4）没有 `CONTINUE`/`ADDFD`；RHEL 8（4.18）基线没有（发行版可能回移，以 `actions_avail` 为准）。
 
 `Makefile` 里两个额外参数不是可选的：
 

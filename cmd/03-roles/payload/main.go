@@ -8,7 +8,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"syscall"
 )
 
@@ -21,16 +20,9 @@ func main() {
 	fmt.Println("== Demo 03 角色三: payload（被监控的业务进程）==")
 	fmt.Printf("pid=%d\n", os.Getpid())
 
-	// 把继承来的 listener fd 关掉。
-	// 监控不会因此失效：supervisor 持有同一个 struct file 的另一份引用，
-	// 过滤器里的 notification 对象就还活着。反过来，supervisor 一旦退出
-	// （所有引用都没了），这些被拦的系统调用会全部变成 ENOSYS。
-	if s := os.Getenv("LISTENER_FD"); s != "" {
-		if fd, err := strconv.Atoi(s); err == nil {
-			syscall.Close(fd)
-			fmt.Printf("已关闭继承来的 listener fd=%d（监控照旧，因为 supervisor 还握着它）\n", fd)
-		}
-	}
+	// 注意：这里没有"处理继承来的 listener fd"的代码，因为压根不该有——
+	// launcher 那份 fd 带 CLOEXEC，execve 时就被内核关掉了；
+	// 唯一握着它的是沙箱外的 supervisor。
 
 	fmt.Println("\n-- 1. 写白名单目录里的文件（会被拦截，但由 supervisor 代劳）--")
 	if err := writeFile(allowFile, "written through the supervisor\n"); err != nil {

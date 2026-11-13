@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 
 	"seccomplab/internal/notif"
@@ -26,10 +27,13 @@ import (
 )
 
 func main() {
+	// 同 demo1：把过滤器和后续 socket() 钉在同一个线程上（README 坑 10）。
+	runtime.LockOSThread()
+
 	fmt.Println("== Demo 05: listener 被关掉之后的 fail-open ==")
 
 	p := scmp.NotifyList([]uint32{uint32(syscall.SYS_SOCKET)})
-	listenerFd, err := scmp.Install(p, scmp.FlagNewListener|scmp.FlagTSync, true)
+	listenerFd, err := scmp.Install(p, scmp.FlagNewListener|scmp.FlagTSync|scmp.FlagTSyncESRCH, true)
 	if err != nil {
 		fmt.Println("安装过滤器失败:", err)
 		os.Exit(1)

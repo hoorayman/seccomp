@@ -24,6 +24,9 @@ func SendFD(sock, fd int) error {
 func RecvFD(sock int) (int, error) {
 	buf := make([]byte, 1)
 	oob := make([]byte, syscall.CmsgSpace(4))
+	// 最后一个 0 是 flags：不带任何可选行为（不 MSG_PEEK / MSG_DONTWAIT / MSG_CMSG_CLOEXEC）。
+	// 它跟"阻塞"没关系——阻塞与否看 socket 自身的 O_NONBLOCK：阻塞 socket + flags=0 会等，
+	// 非阻塞 socket 即使 flags=0 也立刻返回 EAGAIN（实测）。这里能阻塞等，是因为 sock 是阻塞的。
 	_, oobn, _, _, err := syscall.Recvmsg(sock, buf, oob, 0)
 	if err != nil {
 		return -1, fmt.Errorf("recvmsg: %w", err)

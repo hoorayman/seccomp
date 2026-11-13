@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -34,6 +35,10 @@ const (
 )
 
 func main() {
+	// 装过滤器 + 发起 openat 必须钉在同一个线程上（README 坑 10）：
+	// 否则 openat 可能跑在未过滤的线程上，压根不会有通知，demo 就"不灵"了。
+	runtime.LockOSThread()
+
 	fmt.Println("== Demo 04: CONTINUE 的 TOCTOU 竞态 ==")
 
 	for _, d := range []string{allowDir, denyDir} {
@@ -44,7 +49,7 @@ func main() {
 	os.Remove(denyPath)
 
 	p := scmp.NotifyWriteOpenAt()
-	listenerFd, err := scmp.Install(p, scmp.FlagNewListener|scmp.FlagTSync, true)
+	listenerFd, err := scmp.Install(p, scmp.FlagNewListener|scmp.FlagTSync|scmp.FlagTSyncESRCH, true)
 	must(err)
 	fmt.Printf("过滤器已安装，listener fd = %d\n\n", listenerFd)
 

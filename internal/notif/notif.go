@@ -66,7 +66,7 @@ func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
 //
 // 可能的错误：
 //   - EINTR：被信号打断，重试即可
-//   - ENOENT：这条通知对应的线程已经死了（比如被 SIGKILL），重试即可
+//   - ENOENT：这条通知对应的线程已经死了（比如被 SIGKILL），当前这条数据作废，重试是为了去处理下一条新数据。重试即可
 //   - ENOSYS：listener 已经被关闭（所有引用都没了）
 func (n *Notifier) Receive() (*scmp.Notif, error) {
 	req := new(scmp.Notif)
@@ -167,7 +167,7 @@ func (n *Notifier) AddfdAndSend(id uint64, srcfd int, newfdFlags uint32) (int, e
 		return -1, err
 	}
 
-	// 老内核：分两步走。
+	// 下面是兼容老内核的办法：分两步走。先addfd再return val
 	if err := n.IDValid(id); err != nil {
 		return -1, err
 	}
